@@ -1,0 +1,19 @@
+diff --git a/src/devices/src/virtio/fs/linux/passthrough.rs b/src/devices/src/virtio/fs/linux/passthrough.rs
+index 009121c..be26aa2 100644
+--- a/src/devices/src/virtio/fs/linux/passthrough.rs
++++ b/src/devices/src/virtio/fs/linux/passthrough.rs
+@@ -2189,7 +2189,13 @@ impl FileSystem for PassthroughFs {
+                 ret.extend_from_slice(&handle.to_ne_bytes());
+                 Ok(ret)
+             }
+-            _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
++            // vxv patch: report unsupported ioctls (e.g. FS_IOC_GETFLAGS, which
++            // overlayfs copy-up issues on the lower layer) as ENOTTY rather than
++            // EOPNOTSUPP. The kernel's overlayfs tolerates ENOTTY/EINVAL and skips
++            // fileattr copy-up, but treats EOPNOTSUPP as fatal — which otherwise makes
++            // every write to an overlay backed by this virtio-fs fail. ENOTTY is also
++            // the semantically correct errno for an unsupported ioctl on this fd.
++            _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
+         }
+     }
+ }
