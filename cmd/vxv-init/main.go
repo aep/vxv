@@ -15,7 +15,9 @@
 //  5. mount a fresh devpts and allocate a pseudo-terminal;
 //  6. start the shell on the pty slave as a new session leader, dropping to the
 //     caller's uid/gid, in the working directory;
-//  7. relay bytes between libkrun's console (our stdio) and the pty master.
+//  7. relay bytes between libkrun's console (our stdio) and the pty master, and
+//     mirror the console's window size onto the pty whenever the host terminal
+//     is resized.
 //
 // The pty is what gives the guest shell a real controlling terminal (line
 // editing, job control, a working `tty`) even though libkrun hands us a plain
@@ -80,6 +82,7 @@ func run() error {
 		return execNoPTY(shell, argv, cred)
 	}
 	defer master.Close()
+	masterFd := int(master.Fd())
 
 	// Hand ownership of the slave to the target user (what grantpt does), so the
 	// unprivileged shell can read and write its own terminal.
@@ -111,6 +114,21 @@ func run() error {
 		return fmt.Errorf("start shell %s: %w", shell, err)
 	}
 	slave.Close() // the child holds its own copy
+
+	// Keep the shell's terminal in step with the host's. A host SIGWINCH makes
+	// libkrun push a virtio-console resize into the guest; the kernel applies it
+	// to our console (hvc0) and raises SIGWINCH on that console's foreground
+	// process group, which we are in (libkrun's pid 1 claimed hvc0 as the
+	// session's controlling terminal and we are its forked child). What's left
+	// is passing the new size through to the inner pty — setting it on the
+	// master is what makes the kernel signal the shell in turn.
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	go func() {
+		for range winch {
+			syncWinsize(masterFd)
+		}
+	}()
 
 	// Put the guest console (our stdin) into raw mode when it's a tty. libkrun
 	// hands us a cooked console tty; without this, a Ctrl-C byte would make the
@@ -369,13 +387,34 @@ func openPTY() (*os.File, string, error) {
 	return master, fmt.Sprintf("/dev/pts/%d", n), nil
 }
 
-// setWinsize applies the host terminal size (passed by vxv) to the pty.
+// consoleFd is our stdin: the virtio console libkrun gave the guest, and the one
+// device that learns the host terminal's real size.
+const consoleFd = 0
+
+// setWinsize gives the pty its starting size. The console already carries the
+// host's dimensions (libkrun sends them when the port comes up), so prefer those
+// and fall back to what vxv measured on the host, in case the resize message has
+// not landed yet this early in boot.
 func setWinsize(f *os.File) {
-	cols := atoiOr(os.Getenv("VXV_COLS"), 80)
-	rows := atoiOr(os.Getenv("VXV_ROWS"), 24)
-	_ = unix.IoctlSetWinsize(int(f.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
-		Row: uint16(rows), Col: uint16(cols),
-	})
+	ws, err := unix.IoctlGetWinsize(consoleFd, unix.TIOCGWINSZ)
+	if err != nil || (ws.Col == 0 && ws.Row == 0) {
+		ws = &unix.Winsize{
+			Col: uint16(atoiOr(os.Getenv("VXV_COLS"), 80)),
+			Row: uint16(atoiOr(os.Getenv("VXV_ROWS"), 24)),
+		}
+	}
+	_ = unix.IoctlSetWinsize(int(f.Fd()), unix.TIOCSWINSZ, ws)
+}
+
+// syncWinsize copies the console's current window size onto the pty. A zero size
+// means the console has not been told one; leave the pty as it is rather than
+// blanking the shell's idea of its terminal.
+func syncWinsize(ptyFd int) {
+	ws, err := unix.IoctlGetWinsize(consoleFd, unix.TIOCGWINSZ)
+	if err != nil || (ws.Col == 0 && ws.Row == 0) {
+		return
+	}
+	_ = unix.IoctlSetWinsize(ptyFd, unix.TIOCSWINSZ, ws)
 }
 
 // credential parses the target uid/gid/groups. Returns nil to keep root (uid 0),

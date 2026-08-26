@@ -32,15 +32,15 @@ type options struct {
 	env     []string // extra KEY=VALUE pairs from -e
 	tmpfs   bool
 	overlay []string // dirs made writable via ephemeral overlayfs
-	inject  string   // host dir whose tree is laid into the guest fs at boot
+	inject  string   // guestfs tree laid into the guest fs at boot ("" if absent)
 	debug   bool
 }
 
-// defaultInjectDir is the name of the guest-file tree looked for next to the vxv
-// binary when --inject is not given. Ship files under it mirroring their guest
-// paths, e.g. guestfs/etc/claude-code/managed-settings.d/10-auto.json lands at
+// injectDir is the name of the guest-file tree looked for next to the vxv
+// binary. Ship files under it mirroring their guest paths, e.g.
+// guestfs/etc/claude-code/managed-settings.d/10-auto.json lands at
 // /etc/claude-code/managed-settings.d/10-auto.json inside the VM.
-const defaultInjectDir = "guestfs"
+const injectDir = "guestfs"
 
 func newRootCmd() *cobra.Command {
 	o := &options{}
@@ -78,7 +78,7 @@ func newRootCmd() *cobra.Command {
 
 	f := cmd.Flags()
 	f.UintVar(&cpus, "cpus", 2, "number of vCPUs")
-	f.UintVar(&mem, "mem", 2048, "guest RAM in MiB")
+	f.UintVar(&mem, "mem", 16384, "guest RAM in MiB")
 	f.StringVar(&o.root, "root", "/", "host directory exposed READ-ONLY as guest root")
 	f.StringVar(&o.pwd, "pwd", "", "directory exposed READ-WRITE (default: current directory)")
 	f.StringVar(&o.shell, "shell", "", "login shell to run (default: $SHELL, else /bin/bash, else /bin/sh)")
@@ -87,8 +87,6 @@ func newRootCmd() *cobra.Command {
 	f.StringSliceVar(&o.overlay, "overlay",
 		[]string{"/home", "/root", "/etc", "/opt", "/srv", "/usr", "/var"},
 		"dirs made writable via ephemeral overlayfs; writes are discarded on exit (empty disables)")
-	f.StringVar(&o.inject, "inject", "",
-		"host dir whose tree is laid into the guest fs at boot (default: '"+defaultInjectDir+"' next to the vxv binary if present); files land on the ephemeral layer, discarded on exit")
 	f.BoolVar(&o.debug, "debug", false, "enable verbose libkrun logging")
 	return cmd
 }
@@ -204,53 +202,34 @@ func (o *options) resolve() error {
 
 	o.overlay = normalizeOverlays(o.overlay)
 
-	if err := o.resolveInject(); err != nil {
-		return err
-	}
+	o.resolveInject()
 	return nil
 }
 
-// resolveInject locates the guest-file tree. An explicit --inject must exist; the
-// implicit default (a "guestfs" dir next to the binary) is used only if present.
-// Either way the directory must live under --root, since the guest reaches it by
-// reading its host path through the read-only root share.
-func (o *options) resolveInject() error {
-	explicit := o.inject != ""
-	if o.inject == "" {
-		self, err := os.Executable()
-		if err != nil {
-			return nil // can't locate the binary; no default injection
-		}
-		if resolved, err := filepath.EvalSymlinks(self); err == nil {
-			self = resolved
-		}
-		o.inject = filepath.Join(filepath.Dir(self), defaultInjectDir)
-	}
-
-	abs, err := filepath.Abs(o.inject)
+// resolveInject locates the guest-file tree: a "guestfs" dir next to the vxv
+// binary, used only if present. It must live under --root, since the guest
+// reaches it by reading its host path through the read-only root share. Anything
+// missing just means nothing is injected, never an error.
+func (o *options) resolveInject() {
+	self, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve --inject: %w", err)
+		return // can't locate the binary; nothing to inject
 	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
+	if resolved, err := filepath.EvalSymlinks(self); err == nil {
+		self = resolved
 	}
-	o.inject = abs
+	dir := filepath.Join(filepath.Dir(self), injectDir)
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 
-	fi, err := os.Stat(o.inject)
-	if err != nil || !fi.IsDir() {
-		if explicit {
-			return fmt.Errorf("--inject %q is not a directory", o.inject)
-		}
-		o.inject = "" // no default tree present; nothing to inject
-		return nil
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return
 	}
-	if o.root != "/" && !strings.HasPrefix(ensureTrailingSlash(o.inject), ensureTrailingSlash(o.root)) {
-		if explicit {
-			return fmt.Errorf("--inject %s is not under --root %s, so the guest cannot read it", o.inject, o.root)
-		}
-		o.inject = ""
+	if o.root != "/" && !strings.HasPrefix(ensureTrailingSlash(dir), ensureTrailingSlash(o.root)) {
+		return
 	}
-	return nil
+	o.inject = dir
 }
 
 // normalizeOverlays cleans the overlay dir list into absolute, deduplicated,
@@ -387,13 +366,17 @@ func groupList() string {
 }
 
 // terminalSize returns the host terminal's dimensions, or a sane default when
-// stdout is not a terminal.
+// none of our standard streams is a terminal. The fds are tried in the same
+// order libkrun picks the one it takes the guest console's size from, so the
+// boot-time size we hand the guest matches what the console reports later.
 func terminalSize() (cols, rows int) {
-	ws, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
-	if err != nil || ws.Col == 0 {
-		return 80, 24
+	for _, fd := range []int{int(os.Stdin.Fd()), int(os.Stdout.Fd()), int(os.Stderr.Fd())} {
+		ws, err := unix.IoctlGetWinsize(fd, unix.TIOCGWINSZ)
+		if err == nil && ws.Col != 0 {
+			return int(ws.Col), int(ws.Row)
+		}
 	}
-	return int(ws.Col), int(ws.Row)
+	return 80, 24
 }
 
 // isCmdlineSafe reports whether s is printable single-line ASCII, the subset

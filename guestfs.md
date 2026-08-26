@@ -5,8 +5,7 @@ each path: `guestfs/etc/foo/bar` → `/etc/foo/bar` inside the VM. Files land on
 the ephemeral overlay/tmpfs layer, so they exist **only inside the VM** and are
 discarded on exit — the host copies of those paths are never touched.
 
-- The tree is `guestfs/` next to the `vxv` binary by default (used only if it
-  exists). Override with `--inject DIR`.
+- The tree is `guestfs/` next to the `vxv` binary, used only if it exists.
 - The whole tree is mirrored, so put *only* files you want in the guest under it
   (don't drop a README in there — it would become `/README.md`).
 - Ownership and mode are copied from the host source: a file owned by your user
@@ -26,3 +25,20 @@ precedence) in the `.d` drop-in form, so it doesn't clobber other Claude config.
 `auto` is used rather than `bypassPermissions` because the latter is refused
 under root and shows a one-time acceptance dialog that the VM's ephemeral home
 would re-prompt every boot. Delete the file to turn it off, or drop in your own.
+
+`guestfs/etc/claude-code/managed-settings.d/20-vxv-token.json` authenticates
+Claude Code in the guest. Gitignored — it holds a secret. Create it yourself:
+
+```sh
+claude setup-token   # on the host, once; prints an sk-ant-oat01-… token
+cat > guestfs/etc/claude-code/managed-settings.d/20-vxv-token.json <<'EOF'
+{ "env": { "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-…" } }
+EOF
+```
+
+Drop-ins merge, so keeping the token in its own file leaves `10-vxv-auto.json`
+committable. Without it the guest falls back to `~/.claude/.credentials.json`,
+readable through the root share — and a refresh inside the VM rotates that token,
+writes the replacement to the ephemeral `/home` overlay, and drops it on exit,
+leaving the host to prompt for login. A settings `env` token takes precedence
+over the credentials file, so the guest never touches the rotating one.

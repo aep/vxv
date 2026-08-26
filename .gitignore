@@ -11,3 +11,7 @@ nvim.log
 
 # Local, per-user Claude Code settings
 .claude/settings.local.json
+
+# Per-user Claude Code auth token injected into the guest — a secret, never commit.
+# See guestfs.md; generate with `claude setup-token`.
+/guestfs/etc/claude-code/managed-settings.d/20-vxv-token.json
