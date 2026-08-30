@@ -19,6 +19,11 @@
 //     mirror the console's window size onto the pty whenever the host terminal
 //     is resized.
 //
+// Because libkrun's init execs this shim in place, we run as guest PID 1 and
+// carry init's reaping duty: while relaying, we wait() for every child the guest
+// orphans onto us, so zombies (and any fds they still pin) can't accumulate over
+// the life of the VM.
+//
 // The pty is what gives the guest shell a real controlling terminal (line
 // editing, job control, a working `tty`) even though libkrun hands us a plain
 // virtio-serial port. Dropping privileges here — rather than running the shell
@@ -58,8 +63,9 @@ func main() {
 
 func run() error {
 	setupHostname()
-	setupScratch()
+	setupRunTmpfs() // /run first: it backs the overlay upper/work dirs
 	setupOverlays()
+	setupScratch() // remaining scratch dirs, on top of overlays so a nested one (e.g. /var/tmp under the /var overlay) isn't shadowed
 	setupInject()
 	pwd := setupWorkdir()
 	setupBlocks()
@@ -110,6 +116,12 @@ func run() error {
 		Ctty:       0,    // ...the fd at index 0 (stdin => slave)
 		Credential: cred, // drop to the caller's uid/gid (nil => stay root)
 	}
+	// Register for child-death notifications BEFORE starting the shell, so its
+	// exit (or that of an orphan that dies during boot) can't slip through the
+	// gap before we begin reaping.
+	sigchld := make(chan os.Signal, 1)
+	signal.Notify(sigchld, syscall.SIGCHLD)
+
 	if err := cmd.Start(); err != nil {
 		slave.Close()
 		return fmt.Errorf("start shell %s: %w", shell, err)
@@ -119,10 +131,11 @@ func run() error {
 	// Keep the shell's terminal in step with the host's. A host SIGWINCH makes
 	// libkrun push a virtio-console resize into the guest; the kernel applies it
 	// to our console (hvc0) and raises SIGWINCH on that console's foreground
-	// process group, which we are in (libkrun's pid 1 claimed hvc0 as the
-	// session's controlling terminal and we are its forked child). What's left
-	// is passing the new size through to the inner pty — setting it on the
-	// master is what makes the kernel signal the shell in turn.
+	// process group, which we are in (libkrun's init made hvc0 the controlling
+	// terminal and then execed us — that exec replaced it, so we ARE pid 1 and
+	// inherited hvc0's controlling terminal and foreground process group).
+	// What's left is passing the new size through to the inner pty — setting it
+	// on the master is what makes the kernel signal the shell in turn.
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
 	go func() {
@@ -154,19 +167,61 @@ func run() error {
 	}()
 	go io.Copy(master, hostIn) // host keystrokes -> shell
 
-	err = cmd.Wait()
+	// As PID 1 we are the reaper for the entire guest: any process whose parent
+	// exits reparents to us, and one we never wait() for lingers as a zombie.
+	// Reap every dead child on each SIGCHLD until the shell itself exits, then
+	// carry its status out as our own.
+	status := reapUntilShellExits(sigchld, cmd.Process.Pid)
+
 	// The shell has exited; once its last slave fd is gone the master read ends.
 	// Wait for the output copy to drain so we don't truncate the final bytes.
 	master.Close()
 	<-drained
 
-	if ee, ok := err.(*exec.ExitError); ok {
-		if ws, ok := ee.Sys().(syscall.WaitStatus); ok {
-			os.Exit(ws.ExitStatus())
+	os.Exit(status)
+	return nil
+}
+
+// reapUntilShellExits performs PID 1's reaping duty until the interactive shell
+// terminates. Because this shim is pid 1 in the guest, every orphaned process
+// reparents to us; without a wait() they accumulate as zombies (and any that
+// were still holding pipes or ptys keep those fds pinned until reaped). On each
+// SIGCHLD we drain all currently-dead children with a non-blocking Wait4(-1);
+// when the reaped pid is the shell's we return its exit code for run to exit with.
+//
+// We reap the shell here via Wait4 rather than cmd.Wait() on purpose: a
+// Wait4(-1) reaper and cmd.Wait() would race for the shell's zombie, and
+// whichever lost would fail with "no child processes" and drop the exit status.
+func reapUntilShellExits(sigchld <-chan os.Signal, shellPid int) int {
+	for range sigchld {
+		for {
+			var ws syscall.WaitStatus
+			pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+			if err == syscall.EINTR {
+				continue
+			}
+			if pid <= 0 {
+				// pid 0: children remain but none are dead right now — wait for
+				// the next SIGCHLD. pid <0 (ECHILD): no children left at all,
+				// which shouldn't happen while the shell lives; treat as done.
+				break
+			}
+			if pid == shellPid {
+				return waitStatusToExitCode(ws)
+			}
+			// Any other pid was an orphan we've just reaped; keep draining.
 		}
-		os.Exit(1)
 	}
-	return err
+	return 0
+}
+
+// waitStatusToExitCode renders a child's wait status as a process exit code,
+// following the shell convention of 128+signal for a child killed by a signal.
+func waitStatusToExitCode(ws syscall.WaitStatus) int {
+	if ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return ws.ExitStatus()
 }
 
 // setupHostname adopts the host's hostname so the guest isn't just "localhost".
@@ -177,13 +232,26 @@ func setupHostname() {
 	}
 }
 
-// setupScratch mounts ephemeral tmpfs over the standard scratch directories.
-// These live in guest memory only and never touch the host.
+// setupRunTmpfs mounts the ephemeral tmpfs on /run. It runs BEFORE setupOverlays
+// because the overlay upper/work dirs live under /run (see overlayBase); mounting
+// /run after the overlays would shadow those dirs and break every overlay.
+func setupRunTmpfs() {
+	if os.Getenv("VXV_TMPFS") == "0" {
+		return
+	}
+	_ = syscall.Mount("tmpfs", "/run", "tmpfs", 0, "")
+}
+
+// setupScratch mounts ephemeral tmpfs over the remaining scratch directories.
+// These live in guest memory only and never touch the host. It runs AFTER
+// setupOverlays so a scratch dir nested under an overlay target — notably
+// /var/tmp, under the /var overlay — is mounted on top of that overlay instead
+// of being shadowed by it. /run is handled earlier by setupRunTmpfs.
 func setupScratch() {
 	if os.Getenv("VXV_TMPFS") == "0" {
 		return
 	}
-	for _, d := range []string{"/tmp", "/var/tmp", "/run", "/dev/shm"} {
+	for _, d := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
 		_ = syscall.Mount("tmpfs", d, "tmpfs", 0, "")
 	}
 }
@@ -247,7 +315,12 @@ func setupOverlays() {
 			continue
 		}
 
-		opts := "lowerdir=" + target + ",upperdir=" + upper + ",workdir=" + work
+		// metacopy/redirect_dir need trusted.overlay.* xattrs on the layers, which
+		// the virtiofs host-root lower cannot serve (getxattr returns EACCES —
+		// "overlayfs: failed to get metacopy (-13)"), and metadata copy-up then
+		// fails. We need neither feature for an ephemeral upper, so turn both off.
+		opts := "lowerdir=" + target + ",upperdir=" + upper + ",workdir=" + work +
+			",redirect_dir=off,metacopy=off"
 		if err := syscall.Mount("overlay", target, "overlay", 0, opts); err != nil {
 			fmt.Fprintln(os.Stderr, "vxv-init: warning: "+target+" stays read-only (overlay mount failed):", err)
 		}
