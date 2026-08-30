@@ -62,6 +62,7 @@ func run() error {
 	setupOverlays()
 	setupInject()
 	pwd := setupWorkdir()
+	setupBlocks()
 
 	shell := envOr("VXV_SHELL", "/bin/sh")
 	argv := []string{shell}
@@ -362,6 +363,124 @@ func setupWorkdir() string {
 		return "/"
 	}
 	return pwd
+}
+
+// blockBase holds the inaccessible placeholder inodes that mask hidden paths.
+// It sits under /run (guest memory), so nothing here touches the host.
+const blockBase = "/run/vxv-blocked"
+
+// setupBlocks enforces the two .vxv.yaml controls, passed as comma-separated
+// path lists:
+//
+//	VXV_HIDE   files the guest may neither read nor write. Each is shadowed by
+//	           bind-mounting a mode-0000 root-owned placeholder over it, so the
+//	           unprivileged shell sees an empty, inaccessible node in its place.
+//	VXV_RONLY  files the guest may read but not write. Each is bind-mounted over
+//	           itself and remounted read-only, so its real contents stay visible
+//	           while writes fail with EROFS.
+//
+// This runs LAST — after the overlays, the injected tree, and the writable PWD
+// share — so these masks win no matter which layer the real file lives on. A
+// hidden file is masked with an empty file and a directory with an empty
+// directory, since a bind mount requires matching inode types.
+//
+// Everything happens only in the guest mount namespace over in-guest memory;
+// the host files are never touched. A path that doesn't exist on this host is
+// silently skipped, and any single failure is a warning, never fatal.
+func setupBlocks() {
+	hide := splitList(os.Getenv("VXV_HIDE"))
+	ronly := splitList(os.Getenv("VXV_RONLY"))
+	if len(hide) == 0 && len(ronly) == 0 {
+		return
+	}
+
+	applyReadonly(ronly)
+	applyHide(hide)
+}
+
+// applyReadonly bind-mounts each target over itself and remounts it read-only,
+// leaving contents readable but blocking writes.
+func applyReadonly(targets []string) {
+	for _, target := range targets {
+		if _, err := os.Stat(target); err != nil {
+			continue // not present on this host
+		}
+		if err := syscall.Mount(target, target, "", syscall.MS_BIND, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "vxv-init: warning: cannot protect "+target+":", err)
+			continue
+		}
+		if err := syscall.Mount("", target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "vxv-init: warning: "+target+" stays writable (read-only remount failed):", err)
+		}
+	}
+}
+
+// applyHide shadows each target with an inaccessible placeholder so the guest
+// can neither read nor write it.
+func applyHide(targets []string) {
+	if len(targets) == 0 {
+		return
+	}
+
+	// Backing store for the placeholder inodes. Fall back to giving /run its own
+	// tmpfs if it isn't already writable (e.g. --tmpfs disabled), so the masks
+	// stay guest-only regardless.
+	if err := os.MkdirAll(blockBase, 0o755); err != nil {
+		if err := syscall.Mount("tmpfs", "/run", "tmpfs", 0, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "vxv-init: warning: cannot hide files (no writable /run):", err)
+			return
+		}
+		if err := os.MkdirAll(blockBase, 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, "vxv-init: warning: cannot create hide store:", err)
+			return
+		}
+	}
+
+	// One empty file and one empty directory, both mode 0000 and root-owned, so
+	// the dropped-privilege shell has no access through them.
+	emptyFile := filepath.Join(blockBase, "file")
+	emptyDir := filepath.Join(blockBase, "dir")
+	if f, err := os.OpenFile(emptyFile, os.O_CREATE|os.O_WRONLY, 0o000); err == nil {
+		f.Close()
+	} else {
+		fmt.Fprintln(os.Stderr, "vxv-init: warning: cannot create hide placeholder:", err)
+		return
+	}
+	if err := os.Mkdir(emptyDir, 0o000); err != nil && !os.IsExist(err) {
+		fmt.Fprintln(os.Stderr, "vxv-init: warning: cannot create hide placeholder dir:", err)
+		return
+	}
+	_ = os.Chmod(emptyFile, 0o000)
+	_ = os.Chmod(emptyDir, 0o000)
+
+	for _, target := range targets {
+		fi, err := os.Stat(target)
+		if err != nil {
+			continue // not present on this host
+		}
+		src := emptyFile
+		if fi.IsDir() {
+			src = emptyDir
+		}
+		if err := syscall.Mount(src, target, "", syscall.MS_BIND, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "vxv-init: warning: cannot hide "+target+":", err)
+			continue
+		}
+		// Re-assert read-only on the bind so the mask can't be written through
+		// even if the placeholder's mode were somehow bypassed.
+		_ = syscall.Mount("", target, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, "")
+	}
+}
+
+// splitList parses a comma-separated path list, trimming blanks.
+func splitList(list string) []string {
+	var out []string
+	for _, p := range strings.Split(strings.TrimSpace(list), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // openPTY mounts devpts and allocates a pseudo-terminal, returning the master

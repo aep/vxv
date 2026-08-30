@@ -33,6 +33,8 @@ type options struct {
 	tmpfs   bool
 	overlay []string // dirs made writable via ephemeral overlayfs
 	inject  string   // guestfs tree laid into the guest fs at boot ("" if absent)
+	hide     []string // files the guest cannot read or write (from .vxv.yaml)
+	readonly []string // files the guest can read but not write (from .vxv.yaml)
 	debug   bool
 }
 
@@ -203,6 +205,7 @@ func (o *options) resolve() error {
 	o.overlay = normalizeOverlays(o.overlay)
 
 	o.resolveInject()
+	o.resolveBlocks()
 	return nil
 }
 
@@ -324,6 +327,8 @@ func (o *options) buildEnv() ([]string, error) {
 		"VXV_LOGIN="+loginArgs(o.shell),
 		"VXV_TMPFS="+tmpfs,
 		"VXV_OVERLAY="+strings.Join(o.overlay, ","),
+		"VXV_HIDE="+strings.Join(o.hide, ","),
+		"VXV_RONLY="+strings.Join(o.readonly, ","),
 		"VXV_INJECT="+o.inject,
 		"VXV_UID="+strconv.Itoa(os.Getuid()),
 		"VXV_GID="+strconv.Itoa(os.Getgid()),
@@ -399,17 +404,27 @@ func (o *options) printBanner() {
 	if o.inject != "" {
 		inject = o.inject
 	}
+	hide := "(none)"
+	if len(o.hide) > 0 {
+		hide = strings.Join(o.hide, " ")
+	}
+	readonly := "(none)"
+	if len(o.readonly) > 0 {
+		readonly = strings.Join(o.readonly, " ")
+	}
 	fmt.Fprintf(os.Stderr,
 		"┌─ vxv microVM ────────────────────────────────────\n"+
 			"│ root (ro)   : %s\n"+
 			"│ pwd  (rw)   : %s\n"+
 			"│ overlay (∅) : %s\n"+
 			"│ inject      : %s\n"+
+			"│ hidden      : %s\n"+
+			"│ readonly    : %s\n"+
 			"│ resources   : %d vCPU, %d MiB\n"+
 			"│ network     : TSI (host-proxied, policy-ready)\n"+
 			"│ shell       : %s (interactive login)\n"+
 			"└──────────────────────────────────────────────────\n",
-		o.root, o.pwd, overlay, inject, o.cpus, o.memMiB, o.shell)
+		o.root, o.pwd, overlay, inject, hide, readonly, o.cpus, o.memMiB, o.shell)
 }
 
 func ensureTrailingSlash(p string) string {
