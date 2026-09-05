@@ -12,37 +12,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// libkrun virtiofs tags.
-const (
-	// rootTag is libkrun's reserved tag for the guest root filesystem
-	// (KRUN_FS_ROOT_TAG in libkrun.h). Adding it explicitly via AddVirtioFS3 is
-	// the documented way to obtain a read-only root.
-	rootTag = "/dev/root"
-	// pwdTag identifies the writable working-directory share; the guest
-	// bootstrap mounts it over the PWD's real path.
-	pwdTag = "vxvpwd"
-)
+// rootTag is libkrun's reserved tag for the guest root filesystem
+// (KRUN_FS_ROOT_TAG in libkrun.h). vxv serves exactly one share under it: the
+// filesystem view assembled in our private mount namespace, writable at the
+// virtio-fs level because what may be written is decided by the host kernel's
+// mount flags, not by the file server.
+const rootTag = "/dev/root"
 
 type options struct {
-	cpus    uint8
-	memMiB  uint32
-	root    string
-	pwd     string
-	shell   string
-	env     []string // extra KEY=VALUE pairs from -e
-	tmpfs   bool
-	overlay []string // dirs made writable via ephemeral overlayfs
-	inject  string   // guestfs tree laid into the guest fs at boot ("" if absent)
-	hide     []string // files the guest cannot read or write (from .vxv.yaml)
-	readonly []string // files the guest can read but not write (from .vxv.yaml)
-	debug   bool
+	cpus      uint8
+	memMiB    uint32
+	root      string
+	pwd       string
+	shell     string
+	env       []string // extra KEY=VALUE pairs from -e
+	tmpfs     bool
+	overlay   []string // dirs made writable via ephemeral overlayfs
+	injectDir string   // guestfs tree laid into the guest fs ("" if absent)
+	hide      []string // paths the guest cannot read or write (from .vxv.yaml)
+	readonly  []string // paths the guest can read but not write (from .vxv.yaml)
+	caller    *caller  // who the session belongs to
+	debug     bool
 }
 
-// injectDir is the name of the guest-file tree looked for next to the vxv
-// binary. Ship files under it mirroring their guest paths, e.g.
+// injectDirName is the guest-file tree looked for next to the vxv binary. Ship
+// files under it mirroring their guest paths, e.g.
 // guestfs/etc/claude-code/managed-settings.d/10-auto.json lands at
 // /etc/claude-code/managed-settings.d/10-auto.json inside the VM.
-const injectDir = "guestfs"
+const injectDirName = "guestfs"
 
 func newRootCmd() *cobra.Command {
 	o := &options{}
@@ -52,14 +49,17 @@ func newRootCmd() *cobra.Command {
 		Use:   "vxv [flags]",
 		Short: "Open an isolated login shell in a libkrun microVM",
 		Long: "vxv isolates a Claude agent (or any interactive session) inside a libkrun microVM.\n\n" +
-			"The host filesystem is mounted READ-ONLY as the guest root via virtiofs; only the\n" +
-			"working directory is writable (a separate virtiofs share mounted over its real path).\n" +
-			"Directories like /home and /etc are made writable inside the guest via an ephemeral\n" +
-			"overlayfs (--overlay) whose changes live in guest memory and are DISCARDED on exit,\n" +
-			"so the host stays pristine. An interactive login shell is opened with a fresh\n" +
-			"environment. Networking uses\n" +
-			"TSI, proxying all guest traffic through the host network stack so policy can be\n" +
-			"enforced host-side.",
+			"The guest's filesystem is assembled on the host, in a private mount namespace:\n" +
+			"the whole tree is made read-only, the --overlay dirs get an ephemeral overlayfs\n" +
+			"whose writes live in RAM and are DISCARDED on exit, the working directory is bound\n" +
+			"back in writable, and any .vxv.yaml policy is applied last. That view is handed to\n" +
+			"the VM as its root over virtio-fs, so nothing is left for the guest to enforce: it\n" +
+			"cannot remount its way to anything, because vxv itself can no longer reach it.\n" +
+			"An interactive login shell is opened with a fresh environment. Networking uses TSI,\n" +
+			"proxying all guest traffic through the host network stack so policy can be\n" +
+			"enforced host-side.\n\n" +
+			"Building the namespace needs CAP_SYS_ADMIN: run vxv under sudo, or grant it once\n" +
+			"with `setcap cap_sys_admin+ep`. It is dropped again before the VM boots.",
 		Args:          cobra.NoArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -81,7 +81,7 @@ func newRootCmd() *cobra.Command {
 	f := cmd.Flags()
 	f.UintVar(&cpus, "cpus", 2, "number of vCPUs")
 	f.UintVar(&mem, "mem", 16384, "guest RAM in MiB")
-	f.StringVar(&o.root, "root", "/", "host directory exposed READ-ONLY as guest root")
+	f.StringVar(&o.root, "root", "/", "host directory the guest sees as its root")
 	f.StringVar(&o.pwd, "pwd", "", "directory exposed READ-WRITE (default: current directory)")
 	f.StringVar(&o.shell, "shell", "", "login shell to run (default: $SHELL, else /bin/bash, else /bin/sh)")
 	f.StringArrayVarP(&o.env, "env", "e", nil, "extra environment variable KEY=VALUE (repeatable)")
@@ -93,23 +93,75 @@ func newRootCmd() *cobra.Command {
 	return cmd
 }
 
+// execute runs in two stages. The first is this process as launched: it
+// validates everything it can while errors are still cheap, then re-execs into
+// a private mount namespace. The second is that child, which builds the guest's
+// filesystem, drops back to the calling user, and boots the VM.
 func (o *options) execute() error {
-	if err := o.resolve(); err != nil {
+	stage2 := os.Getenv(stageEnv) != ""
+	if err := o.resolve(stage2); err != nil {
 		return err
 	}
 
-	// Preflight: the environment must be able to run a microVM at all.
+	if !stage2 {
+		if err := requireSysAdmin(); err != nil {
+			return err
+		}
+		if err := preflight(); err != nil {
+			return err
+		}
+		return reexec()
+	}
+
+	// Re-checked on this side of the re-exec: the namespace exists, but a
+	// capability that failed to survive the exec would otherwise surface as an
+	// unexplained EPERM from the first mount.
+	if err := requireSysAdmin(); err != nil {
+		return err
+	}
+	warnBuildCaps()
+
+	shim, err := o.buildGuestRoot()
+	if err != nil {
+		return err
+	}
+	o.printBanner()
+
+	// From here on this process holds nothing the caller doesn't. Everything the
+	// guest will ever be allowed to touch was decided above.
+	if err := o.caller.drop(); err != nil {
+		return err
+	}
+	raiseNoFile()
+	return o.boot(shim)
+}
+
+// preflight checks that the environment can run a microVM at all.
+func preflight() error {
 	if !krun.IsAvailable() {
 		return fmt.Errorf("libkrun reports the platform is unavailable (is libkrun installed and KVM accessible?)")
 	}
 	if _, err := os.Stat("/dev/kvm"); err != nil {
 		return fmt.Errorf("/dev/kvm not accessible: %w", err)
 	}
+	return nil
+}
 
+// boot configures libkrun and hands it the assembled root. The guest entrypoint
+// is our statically linked shim (libkrun can only exec a static binary as the
+// first guest process); it lives in the namespace's scratch tmpfs, which the
+// guest reaches through the same share.
+func (o *options) boot(shim string) error {
 	if o.debug {
 		_ = krun.SetLogLevel(krun.LogLevelDebug)
 	} else {
 		_ = krun.SetLogLevel(krun.LogLevelError)
+	}
+
+	// Re-checked here, after the privilege drop: /dev/kvm was reachable while we
+	// were building the namespace, but the caller is who has to open it.
+	if err := unix.Access("/dev/kvm", unix.R_OK|unix.W_OK); err != nil {
+		return fmt.Errorf("/dev/kvm is not accessible to uid %d (is that user in the kvm group?): %w", os.Getuid(), err)
 	}
 
 	ctx, err := krun.CreateContext()
@@ -124,16 +176,13 @@ func (o *options) execute() error {
 		return fmt.Errorf("set vm config: %w", err)
 	}
 
-	// Root filesystem: the host's `/` (or --root), exposed READ-ONLY. shmSize 0
-	// disables the DAX window; the final argument enforces read-only in virtiofs.
-	if err := ctx.AddVirtioFS3(rootTag, o.root, 0, true); err != nil {
-		return fmt.Errorf("add read-only root virtiofs (%s): %w", o.root, err)
-	}
-
-	// Working directory: a second, WRITABLE virtiofs share. The guest bootstrap
-	// mounts it over o.pwd so writes land back on the host at that path.
-	if err := ctx.AddVirtioFS(pwdTag, o.pwd); err != nil {
-		return fmt.Errorf("add writable pwd virtiofs (%s): %w", o.pwd, err)
+	// The one share: our namespace's view of o.root. shmSize 0 disables the DAX
+	// window; the final argument would make virtio-fs itself refuse writes, which
+	// we do not want — read-only is the host kernel's job here, and the parts of
+	// the tree that are writable (the working directory, the overlays) have to
+	// stay writable through this same share.
+	if err := ctx.AddVirtioFS3(rootTag, o.root, 0, false); err != nil {
+		return fmt.Errorf("add root virtiofs (%s): %w", o.root, err)
 	}
 
 	// Networking is intentionally left implicit: libkrun creates a vsock device
@@ -148,22 +197,10 @@ func (o *options) execute() error {
 		return fmt.Errorf("set env: %w", err)
 	}
 
-	// The guest entrypoint is our statically linked shim (libkrun can only exec
-	// a static binary as the first guest process). It sets up the mounts and
-	// then execs the interactive login shell. It lives on the host and, since
-	// the guest root IS the host root, is visible read-only inside the guest.
-	shim, err := materializeInit()
-	if err != nil {
-		return err
-	}
-	if !strings.HasPrefix(shim, ensureTrailingSlash(o.root)) && o.root != "/" {
-		return fmt.Errorf("guest shim %s is not under --root %s, so the guest cannot exec it; use --root / or a root that contains %s", shim, o.root, shim)
-	}
-	if err := ctx.SetExec(shim, []string{shim}, envp); err != nil {
+	guestShim := o.guestPath(shim)
+	if err := ctx.SetExec(guestShim, []string{guestShim}, envp); err != nil {
 		return fmt.Errorf("set exec: %w", err)
 	}
-
-	o.printBanner()
 
 	// Hands control to the VMM. On success this exits the process with the
 	// guest's exit code; it only returns here if boot configuration failed.
@@ -173,8 +210,16 @@ func (o *options) execute() error {
 	return nil
 }
 
-// resolve normalizes paths and derives defaults.
-func (o *options) resolve() error {
+// resolve normalizes paths and derives defaults. The policy and guestfs lookups
+// only matter to the stage that builds the namespace, and are skipped in the
+// first one so their warnings are not printed twice.
+func (o *options) resolve(withPolicy bool) error {
+	o.caller = resolveCaller()
+
+	if rootAbs, err := filepath.Abs(o.root); err == nil {
+		o.root = filepath.Clean(rootAbs)
+	}
+
 	if o.pwd == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -193,26 +238,33 @@ func (o *options) resolve() error {
 		return fmt.Errorf("--pwd %q is not a directory", abs)
 	}
 	o.pwd = abs
-
-	if rootAbs, err := filepath.Abs(o.root); err == nil {
-		o.root = rootAbs
+	if o.pwd == o.root {
+		return fmt.Errorf("--pwd %q is the guest root itself; give a directory inside it", o.pwd)
+	}
+	if !strings.HasPrefix(ensureTrailingSlash(o.pwd), ensureTrailingSlash(o.root)) {
+		return fmt.Errorf("--pwd %q is outside --root %q, so the guest could not see it", o.pwd, o.root)
+	}
+	if run := filepath.Join(o.root, "run"); strings.HasPrefix(ensureTrailingSlash(o.pwd), ensureTrailingSlash(run)) {
+		return fmt.Errorf("--pwd %q is under %s, where vxv mounts the guest's own tmpfs", o.pwd, run)
 	}
 
 	if o.shell == "" {
-		o.shell = defaultShell()
+		o.shell = defaultShell(o.caller.shell)
 	}
 
 	o.overlay = normalizeOverlays(o.overlay)
 
-	o.resolveInject()
-	o.resolveBlocks()
+	if withPolicy {
+		o.resolveInject()
+		o.resolvePolicy()
+	}
 	return nil
 }
 
 // resolveInject locates the guest-file tree: a "guestfs" dir next to the vxv
 // binary, used only if present. It must live under --root, since the guest
-// reaches it by reading its host path through the read-only root share. Anything
-// missing just means nothing is injected, never an error.
+// reaches it by way of that share. Anything missing just means nothing is
+// injected, never an error.
 func (o *options) resolveInject() {
 	self, err := os.Executable()
 	if err != nil {
@@ -221,7 +273,7 @@ func (o *options) resolveInject() {
 	if resolved, err := filepath.EvalSymlinks(self); err == nil {
 		self = resolved
 	}
-	dir := filepath.Join(filepath.Dir(self), injectDir)
+	dir := filepath.Join(filepath.Dir(self), injectDirName)
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = resolved
 	}
@@ -229,16 +281,25 @@ func (o *options) resolveInject() {
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return
 	}
-	if o.root != "/" && !strings.HasPrefix(ensureTrailingSlash(dir), ensureTrailingSlash(o.root)) {
-		return
+	o.injectDir = dir
+}
+
+// guestPath translates a host path in our namespace into the path the guest
+// will see it at. They are the same string for the usual --root /.
+func (o *options) guestPath(host string) string {
+	if o.root == "/" {
+		return host
 	}
-	o.inject = dir
+	rel, err := filepath.Rel(o.root, host)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return host
+	}
+	return "/" + rel
 }
 
 // normalizeOverlays cleans the overlay dir list into absolute, deduplicated,
 // comma-free paths. Entries that aren't absolute or contain a comma are dropped:
-// the list is joined with commas into VXV_OVERLAY, and the guest splits on both
-// commas and the overlayfs option separator, so neither can appear in a path.
+// the paths go into an overlayfs option string, where a comma would split them.
 func normalizeOverlays(dirs []string) []string {
 	seen := make(map[string]bool, len(dirs))
 	out := make([]string, 0, len(dirs))
@@ -257,12 +318,12 @@ func normalizeOverlays(dirs []string) []string {
 	return out
 }
 
-// defaultShell picks the user's shell, falling back to common ones. Because the
-// guest root IS the host root, any host shell path is valid inside the guest.
-func defaultShell() string {
-	if s := os.Getenv("SHELL"); s != "" {
-		if _, err := os.Stat(s); err == nil {
-			return s
+// defaultShell picks the caller's shell, falling back to common ones. Because
+// the guest root IS the host root, any host shell path is valid inside the guest.
+func defaultShell(preferred string) string {
+	if preferred != "" {
+		if _, err := os.Stat(preferred); err == nil {
+			return preferred
 		}
 	}
 	for _, s := range []string{"/bin/bash", "/usr/bin/bash", "/bin/sh"} {
@@ -289,10 +350,10 @@ func loginArgs(shell string) string {
 // they need with -e. Every entry is validated to be single-line ASCII, since
 // libkrun folds the environment into the guest kernel command line.
 //
-// The identity variables (VXV_UID/GID/GROUPS) are taken from this process's own
-// credentials — the real caller — and are appended LAST so a -e cannot shadow
-// them. Combined with rejecting any -e VXV_* key, this guarantees a user running
-// vxv cannot make the guest drop to a different user's uid.
+// The identity variables (VXV_UID/GID/GROUPS) are the caller's — the real user,
+// not whatever sudo made this process — and are appended LAST so a -e cannot
+// shadow them. Combined with rejecting any -e VXV_* key, this guarantees a user
+// running vxv cannot make the guest drop to a different user's uid.
 func (o *options) buildEnv() ([]string, error) {
 	tmpfs := "0"
 	if o.tmpfs {
@@ -301,7 +362,7 @@ func (o *options) buildEnv() ([]string, error) {
 	env := []string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"TERM=" + orDefault(os.Getenv("TERM"), "xterm-256color"),
-		"HOME=" + orDefault(os.Getenv("HOME"), "/root"),
+		"HOME=" + orDefault(o.caller.home, "/root"),
 	}
 
 	// User-supplied variables, before the trusted control block.
@@ -321,18 +382,13 @@ func (o *options) buildEnv() ([]string, error) {
 	env = append(env,
 		"VXV=1",
 		"VXV_INIT=1",
-		"VXV_PWD="+o.pwd,
-		"VXV_TAG="+pwdTag,
+		"VXV_PWD="+o.guestPath(o.pwd),
 		"VXV_SHELL="+o.shell,
 		"VXV_LOGIN="+loginArgs(o.shell),
 		"VXV_TMPFS="+tmpfs,
-		"VXV_OVERLAY="+strings.Join(o.overlay, ","),
-		"VXV_HIDE="+strings.Join(o.hide, ","),
-		"VXV_RONLY="+strings.Join(o.readonly, ","),
-		"VXV_INJECT="+o.inject,
-		"VXV_UID="+strconv.Itoa(os.Getuid()),
-		"VXV_GID="+strconv.Itoa(os.Getgid()),
-		"VXV_GROUPS="+groupList(),
+		"VXV_UID="+strconv.Itoa(o.caller.uid),
+		"VXV_GID="+strconv.Itoa(o.caller.gid),
+		"VXV_GROUPS="+groupList(o.caller.groups),
 		"VXV_COLS="+strconv.Itoa(cols),
 		"VXV_ROWS="+strconv.Itoa(rows),
 		"VXV_HOSTNAME="+hostname(),
@@ -358,11 +414,7 @@ func hostname() string {
 }
 
 // groupList renders the caller's supplementary groups as a comma-separated list.
-func groupList() string {
-	gids, err := os.Getgroups()
-	if err != nil {
-		return ""
-	}
+func groupList(gids []int) string {
 	parts := make([]string, 0, len(gids))
 	for _, g := range gids {
 		parts = append(parts, strconv.Itoa(g))
@@ -396,22 +448,6 @@ func isCmdlineSafe(s string) bool {
 }
 
 func (o *options) printBanner() {
-	overlay := "(none)"
-	if len(o.overlay) > 0 {
-		overlay = strings.Join(o.overlay, " ")
-	}
-	inject := "(none)"
-	if o.inject != "" {
-		inject = o.inject
-	}
-	hide := "(none)"
-	if len(o.hide) > 0 {
-		hide = strings.Join(o.hide, " ")
-	}
-	readonly := "(none)"
-	if len(o.readonly) > 0 {
-		readonly = strings.Join(o.readonly, " ")
-	}
 	fmt.Fprintf(os.Stderr,
 		"┌─ vxv microVM ────────────────────────────────────\n"+
 			"│ root (ro)   : %s\n"+
@@ -422,9 +458,11 @@ func (o *options) printBanner() {
 			"│ readonly    : %s\n"+
 			"│ resources   : %d vCPU, %d MiB\n"+
 			"│ network     : TSI (host-proxied, policy-ready)\n"+
-			"│ shell       : %s (interactive login)\n"+
+			"│ shell       : %s (interactive login, uid %d)\n"+
 			"└──────────────────────────────────────────────────\n",
-		o.root, o.pwd, overlay, inject, hide, readonly, o.cpus, o.memMiB, o.shell)
+		o.root, o.pwd, orNone(o.overlay), orDefault(o.injectDir, "(none)"),
+		orNone(o.hide), orNone(o.readonly),
+		o.cpus, o.memMiB, o.shell, o.caller.uid)
 }
 
 func ensureTrailingSlash(p string) string {
@@ -439,4 +477,11 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+func orNone(list []string) string {
+	if len(list) == 0 {
+		return "(none)"
+	}
+	return strings.Join(list, " ")
 }

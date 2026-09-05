@@ -1,9 +1,10 @@
 # guestfs — injecting files into the VM
 
-`vxv` lays a host directory tree into the guest filesystem at boot, mirroring
-each path: `guestfs/etc/foo/bar` → `/etc/foo/bar` inside the VM. Files land on
-the ephemeral overlay/tmpfs layer, so they exist **only inside the VM** and are
-discarded on exit — the host copies of those paths are never touched.
+`vxv` lays a host directory tree into the guest filesystem while it assembles the
+guest's mount namespace, mirroring each path: `guestfs/etc/foo/bar` →
+`/etc/foo/bar` inside the VM. Files land on the ephemeral overlay layer, so they
+exist **only inside the VM** and are discarded on exit — the host copies of those
+paths are never touched.
 
 - The tree is `guestfs/` next to the `vxv` binary, used only if it exists.
 - The whole tree is mirrored, so put *only* files you want in the guest under it
@@ -13,9 +14,12 @@ discarded on exit — the host copies of those paths are never touched.
   directories are created with the source's owner/mode; pre-existing system dirs
   (e.g. `/etc`) keep their own ownership. The guest shares the host's uid space,
   so numeric owners carry over as-is.
-- Destinations must be writable in the guest, i.e. under an `--overlay` dir
-  (`/etc`, `/home`, … by default). Injecting outside those is skipped with a
+- Destinations must be under an `--overlay` dir (`/etc`, `/home`, … by default);
+  everything else is read-only by then. Injecting outside those is skipped with a
   warning.
+- The copy runs before vxv drops privileges, but DAC still applies: writing into
+  a root-owned dir like `/etc` needs `sudo vxv`. A setcap'd vxv (CAP_SYS_ADMIN
+  only, no CAP_DAC_OVERRIDE) can only inject where the calling user could write.
 
 ## What ships here
 
